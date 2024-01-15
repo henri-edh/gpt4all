@@ -15,7 +15,7 @@ jobs:
 
     - name: Fetch upstream changes
       run: |
-        git remote add upstream https://github.com/henri-edh/gpt4all.git
+        git remote add upstream https://github.com/nomic-ai/gpt4all.git
         git fetch upstream
 
     - name: Merge upstream changes
