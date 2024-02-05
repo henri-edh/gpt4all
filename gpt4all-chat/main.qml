@@ -410,7 +410,7 @@ Window {
     SettingsDialog {
         id: settingsDialog
         anchors.centerIn: parent
-        width: Math.min(1280, window.width - (window.width * .1))
+        width: Math.min(1920, window.width - (window.width * .1))
         height: window.height - (window.height * .1)
         onDownloadClicked: {
             downloadNewModels.showEmbeddingModels = true
@@ -736,7 +736,7 @@ Window {
     ModelDownloaderDialog {
         id: downloadNewModels
         anchors.centerIn: parent
-        width: Math.min(1280, window.width - (window.width * .1))
+        width: Math.min(1920, window.width - (window.width * .1))
         height: window.height - (window.height * .1)
         Item {
             Accessible.role: Accessible.Dialog
@@ -1129,7 +1129,7 @@ Window {
                 }
 
                 Image {
-                    visible: currentChat.isServer || currentChat.modelInfo.isChatGPT
+                    visible: currentChat.isServer || currentChat.modelInfo.isOnline
                     anchors.fill: parent
                     sourceSize.width: 1024
                     sourceSize.height: 1024
