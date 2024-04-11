@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ctypes
-import logging
 import os
 import platform
 import re
@@ -10,14 +9,20 @@ import sys
 import threading
 from enum import Enum
 from queue import Queue
-from typing import Callable, Iterable, List
+from typing import Any, Callable, Generic, Iterable, NoReturn, TypeVar, overload
 
 if sys.version_info >= (3, 9):
     import importlib.resources as importlib_resources
 else:
     import importlib_resources
 
-logger: logging.Logger = logging.getLogger(__name__)
+if (3, 9) <= sys.version_info < (3, 11):
+    # python 3.9 broke generic TypedDict, python 3.11 fixed it
+    from typing_extensions import TypedDict
+else:
+    from typing import TypedDict
+
+EmbeddingsType = TypeVar('EmbeddingsType', bound='list[Any]')
 
 
 # TODO: provide a config file to make this more robust
@@ -28,7 +33,7 @@ def load_llmodel_library():
     ext = {"Darwin": "dylib", "Linux": "so", "Windows": "dll"}[platform.system()]
 
     try:
-        # Linux, Windows, MinGW
+        # macOS, Linux, MinGW
         lib = ctypes.CDLL(str(MODEL_LIB_PATH / f"libllmodel.{ext}"))
     except FileNotFoundError:
         if ext != 'dll':
@@ -100,17 +105,24 @@ llmodel.llmodel_prompt.argtypes = [
     RecalculateCallback,
     ctypes.POINTER(LLModelPromptContext),
     ctypes.c_bool,
+    ctypes.c_char_p,
 ]
 
 llmodel.llmodel_prompt.restype = None
 
-llmodel.llmodel_embedding.argtypes = [
+llmodel.llmodel_embed.argtypes = [
     ctypes.c_void_p,
-    ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_char_p),
     ctypes.POINTER(ctypes.c_size_t),
+    ctypes.c_char_p,
+    ctypes.c_int,
+    ctypes.POINTER(ctypes.c_size_t),
+    ctypes.c_bool,
+    ctypes.c_bool,
+    ctypes.POINTER(ctypes.c_char_p),
 ]
 
-llmodel.llmodel_embedding.restype = ctypes.POINTER(ctypes.c_float)
+llmodel.llmodel_embed.restype = ctypes.POINTER(ctypes.c_float)
 
 llmodel.llmodel_free_embedding.argtypes = [ctypes.POINTER(ctypes.c_float)]
 llmodel.llmodel_free_embedding.restype = None
@@ -124,9 +136,9 @@ llmodel.llmodel_set_implementation_search_path.restype = None
 llmodel.llmodel_threadCount.argtypes = [ctypes.c_void_p]
 llmodel.llmodel_threadCount.restype = ctypes.c_int32
 
-llmodel.llmodel_set_implementation_search_path(str(MODEL_LIB_PATH).replace("\\", r"\\").encode())
+llmodel.llmodel_set_implementation_search_path(str(MODEL_LIB_PATH).encode())
 
-llmodel.llmodel_available_gpu_devices.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int32)]
+llmodel.llmodel_available_gpu_devices.argtypes = [ctypes.c_size_t, ctypes.POINTER(ctypes.c_int32)]
 llmodel.llmodel_available_gpu_devices.restype = ctypes.POINTER(LLModelGPUDevice)
 
 llmodel.llmodel_gpu_init_gpu_device_by_string.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
@@ -152,6 +164,11 @@ def empty_response_callback(token_id: int, response: str) -> bool:
 # Symbol to terminate from generator
 class Sentinel(Enum):
     TERMINATING_SYMBOL = 0
+
+
+class EmbedResult(Generic[EmbeddingsType], TypedDict):
+    embeddings: EmbeddingsType
+    n_prompt_tokens: int
 
 
 class LLModel:
@@ -182,43 +199,54 @@ class LLModel:
         model = llmodel.llmodel_model_create2(self.model_path, b"auto", ctypes.byref(err))
         if model is None:
             s = err.value
-            raise ValueError(f"Unable to instantiate model: {'null' if s is None else s.decode()}")
-        self.model = model
+            raise RuntimeError(f"Unable to instantiate model: {'null' if s is None else s.decode()}")
+        self.model: ctypes.c_void_p | None = model
 
-    def __del__(self):
+    def __del__(self, llmodel=llmodel):
         if hasattr(self, 'model'):
-            llmodel.llmodel_model_destroy(self.model)
+            self.close()
 
-    def _list_gpu(self, mem_required: int) -> list[LLModelGPUDevice]:
+    def close(self) -> None:
+        if self.model is not None:
+            llmodel.llmodel_model_destroy(self.model)
+            self.model = None
+
+    def _raise_closed(self) -> NoReturn:
+        raise ValueError("Attempted operation on a closed LLModel")
+
+    @staticmethod
+    def list_gpus(mem_required: int = 0) -> list[str]:
+        """
+        List the names of the available GPU devices with at least `mem_required` bytes of VRAM.
+
+        Args:
+            mem_required: The minimum amount of VRAM, in bytes
+
+        Returns:
+            A list of strings representing the names of the available GPU devices.
+        """
         num_devices = ctypes.c_int32(0)
-        devices_ptr = llmodel.llmodel_available_gpu_devices(self.model, mem_required, ctypes.byref(num_devices))
+        devices_ptr = llmodel.llmodel_available_gpu_devices(mem_required, ctypes.byref(num_devices))
         if not devices_ptr:
             raise ValueError("Unable to retrieve available GPU devices")
-        return devices_ptr[:num_devices.value]
+        return [d.name.decode() for d in devices_ptr[:num_devices.value]]
 
     def init_gpu(self, device: str):
+        if self.model is None:
+            self._raise_closed()
+
         mem_required = llmodel.llmodel_required_mem(self.model, self.model_path, self.n_ctx, self.ngl)
 
         if llmodel.llmodel_gpu_init_gpu_device_by_string(self.model, mem_required, device.encode()):
             return
 
-        # Retrieve all GPUs without considering memory requirements.
-        num_devices = ctypes.c_int32(0)
-        all_devices_ptr = llmodel.llmodel_available_gpu_devices(self.model, 0, ctypes.byref(num_devices))
-        if not all_devices_ptr:
-            raise ValueError("Unable to retrieve list of all GPU devices")
-        all_gpus = [d.name.decode() for d in all_devices_ptr[:num_devices.value]]
-
-        # Retrieve GPUs that meet the memory requirements using list_gpu
-        available_gpus = [device.name.decode() for device in self._list_gpu(mem_required)]
-
-        # Identify GPUs that are unavailable due to insufficient memory or features
+        all_gpus = self.list_gpus()
+        available_gpus = self.list_gpus(mem_required)
         unavailable_gpus = set(all_gpus).difference(available_gpus)
 
-        # Formulate the error message
-        error_msg = "Unable to initialize model on GPU: '{}'.".format(device)
-        error_msg += "\nAvailable GPUs: {}.".format(available_gpus)
-        error_msg += "\nUnavailable GPUs due to insufficient memory or features: {}.".format(unavailable_gpus)
+        error_msg = "Unable to initialize model on GPU: {!r}".format(device)
+        error_msg += "\nAvailable GPUs: {}".format(available_gpus)
+        error_msg += "\nUnavailable GPUs due to insufficient memory or features: {}".format(unavailable_gpus)
         raise ValueError(error_msg)
 
     def load_model(self) -> bool:
@@ -229,14 +257,21 @@ class LLModel:
         -------
         True if model loaded successfully, False otherwise
         """
+        if self.model is None:
+            self._raise_closed()
+
         return llmodel.llmodel_loadModel(self.model, self.model_path, self.n_ctx, self.ngl)
 
     def set_thread_count(self, n_threads):
+        if self.model is None:
+            self._raise_closed()
         if not llmodel.llmodel_isModelLoaded(self.model):
             raise Exception("Model not loaded")
         llmodel.llmodel_setThreadCount(self.model, n_threads)
 
     def thread_count(self):
+        if self.model is None:
+            self._raise_closed()
         if not llmodel.llmodel_isModelLoaded(self.model):
             raise Exception("Model not loaded")
         return llmodel.llmodel_threadCount(self.model)
@@ -286,16 +321,60 @@ class LLModel:
         self.context.repeat_last_n = repeat_last_n
         self.context.context_erase = context_erase
 
-    def generate_embedding(self, text: str) -> List[float]:
-        if not text:
-            raise ValueError("Text must not be None or empty")
+    @overload
+    def generate_embeddings(
+        self, text: str, prefix: str, dimensionality: int, do_mean: bool, atlas: bool,
+    ) -> EmbedResult[list[float]]: ...
+    @overload
+    def generate_embeddings(
+        self, text: list[str], prefix: str | None, dimensionality: int, do_mean: bool, atlas: bool,
+    ) -> EmbedResult[list[list[float]]]: ...
+    @overload
+    def generate_embeddings(
+        self, text: str | list[str], prefix: str | None, dimensionality: int, do_mean: bool, atlas: bool,
+    ) -> EmbedResult[list[Any]]: ...
 
+    def generate_embeddings(
+        self, text: str | list[str], prefix: str | None, dimensionality: int, do_mean: bool, atlas: bool,
+    ) -> EmbedResult[list[Any]]:
+        if not text:
+            raise ValueError("text must not be None or empty")
+
+        if self.model is None:
+            self._raise_closed()
+
+        if (single_text := isinstance(text, str)):
+            text = [text]
+
+        # prepare input
         embedding_size = ctypes.c_size_t()
-        c_text = ctypes.c_char_p(text.encode())
-        embedding_ptr = llmodel.llmodel_embedding(self.model, c_text, ctypes.byref(embedding_size))
-        embedding_array = [embedding_ptr[i] for i in range(embedding_size.value)]
+        token_count = ctypes.c_size_t()
+        error = ctypes.c_char_p()
+        c_prefix = ctypes.c_char_p() if prefix is None else prefix.encode()
+        c_texts = (ctypes.c_char_p * (len(text) + 1))()
+        for i, t in enumerate(text):
+            c_texts[i] = t.encode()
+
+        # generate the embeddings
+        embedding_ptr = llmodel.llmodel_embed(
+            self.model, c_texts, ctypes.byref(embedding_size), c_prefix, dimensionality, ctypes.byref(token_count),
+            do_mean, atlas, ctypes.byref(error),
+        )
+
+        if not embedding_ptr:
+            msg = "(unknown error)" if error.value is None else error.value.decode()
+            raise RuntimeError(f'Failed to generate embeddings: {msg}')
+
+        # extract output
+        n_embd = embedding_size.value // len(text)
+        embedding_array = [
+            embedding_ptr[i:i + n_embd]
+            for i in range(0, embedding_size.value, n_embd)
+        ]
         llmodel.llmodel_free_embedding(embedding_ptr)
-        return list(embedding_array)
+
+        embeddings = embedding_array[0] if single_text else embedding_array
+        return {'embeddings': embeddings, 'n_prompt_tokens': token_count.value}
 
     def prompt_model(
         self,
@@ -329,15 +408,11 @@ class LLModel:
         None
         """
 
+        if self.model is None:
+            self._raise_closed()
+
         self.buffer.clear()
         self.buff_expecting_cont_bytes = 0
-
-        logger.info(
-            "LLModel.prompt_model -- prompt:\n"
-            + "%s\n"
-            + "===/LLModel.prompt_model -- prompt/===",
-            prompt,
-        )
 
         self._set_context(
             n_predict=n_predict,
@@ -361,12 +436,16 @@ class LLModel:
             RecalculateCallback(self._recalculate_callback),
             self.context,
             special,
+            ctypes.c_char_p(),
         )
 
 
     def prompt_model_streaming(
         self, prompt: str, prompt_template: str, callback: ResponseCallbackType = empty_response_callback, **kwargs
     ) -> Iterable[str]:
+        if self.model is None:
+            self._raise_closed()
+
         output_queue: Queue[str | Sentinel] = Queue()
 
         # Put response tokens into an output queue
