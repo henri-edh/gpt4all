@@ -33,13 +33,16 @@ public:
     std::vector<GPUDevice> availableGPUDevices(size_t memoryRequired) const override;
     bool initializeGPUDevice(size_t memoryRequired, const std::string &name) const override;
     bool initializeGPUDevice(int device, std::string *unavail_reason = nullptr) const override;
-    bool hasGPUDevice() override;
-    bool usingGPUDevice() override;
+    bool hasGPUDevice() const override;
+    bool usingGPUDevice() const override;
+    const char *backendName() const override;
+    const char *gpuDeviceName() const override;
 
     size_t embeddingSize() const override;
     // user-specified prefix
     void embed(const std::vector<std::string> &texts, float *embeddings, std::optional<std::string> prefix,
-               int dimensionality = -1, size_t *tokenCount = nullptr, bool doMean = true, bool atlas = false) override;
+               int dimensionality = -1, size_t *tokenCount = nullptr, bool doMean = true, bool atlas = false,
+               EmbedCancelCallback *cancelCb = nullptr) override;
     // automatic prefix
     void embed(const std::vector<std::string> &texts, float *embeddings, bool isRetrieval, int dimensionality = -1,
                size_t *tokenCount = nullptr, bool doMean = true, bool atlas = false) override;
@@ -61,7 +64,8 @@ protected:
     int32_t layerCount(std::string const &modelPath) const override;
 
     void embedInternal(const std::vector<std::string> &texts, float *embeddings, std::string prefix, int dimensionality,
-                       size_t *tokenCount, bool doMean, bool atlas, const EmbModelSpec *spec);
+                       size_t *tokenCount, bool doMean, bool atlas, EmbedCancelCallback *cancelCb,
+                       const EmbModelSpec *spec);
 };
 
 #endif // LLAMAMODEL_H

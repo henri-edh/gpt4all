@@ -9,7 +9,7 @@ import sys
 import threading
 from enum import Enum
 from queue import Queue
-from typing import Any, Callable, Generic, Iterable, NoReturn, TypeVar, overload
+from typing import TYPE_CHECKING, Any, Callable, Generic, Iterable, Literal, NoReturn, TypeVar, overload
 
 if sys.version_info >= (3, 9):
     import importlib.resources as importlib_resources
@@ -21,6 +21,9 @@ if (3, 9) <= sys.version_info < (3, 11):
     from typing_extensions import TypedDict
 else:
     from typing import TypedDict
+
+if TYPE_CHECKING:
+    from typing_extensions import TypeAlias
 
 EmbeddingsType = TypeVar('EmbeddingsType', bound='list[Any]')
 
@@ -95,6 +98,7 @@ llmodel.llmodel_isModelLoaded.restype = ctypes.c_bool
 PromptCallback = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_int32)
 ResponseCallback = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_int32, ctypes.c_char_p)
 RecalculateCallback = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_bool)
+EmbCancelCallback = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.POINTER(ctypes.c_uint), ctypes.c_uint, ctypes.c_char_p)
 
 llmodel.llmodel_prompt.argtypes = [
     ctypes.c_void_p,
@@ -119,6 +123,7 @@ llmodel.llmodel_embed.argtypes = [
     ctypes.POINTER(ctypes.c_size_t),
     ctypes.c_bool,
     ctypes.c_bool,
+    EmbCancelCallback,
     ctypes.POINTER(ctypes.c_char_p),
 ]
 
@@ -153,8 +158,15 @@ llmodel.llmodel_gpu_init_gpu_device_by_int.restype = ctypes.c_bool
 llmodel.llmodel_has_gpu_device.argtypes = [ctypes.c_void_p]
 llmodel.llmodel_has_gpu_device.restype = ctypes.c_bool
 
+llmodel.llmodel_model_backend_name.argtypes = [ctypes.c_void_p]
+llmodel.llmodel_model_backend_name.restype = ctypes.c_char_p
+
+llmodel.llmodel_model_gpu_device_name.argtypes = [ctypes.c_void_p]
+llmodel.llmodel_model_gpu_device_name.restype = ctypes.c_char_p
+
 ResponseCallbackType = Callable[[int, str], bool]
 RawResponseCallbackType = Callable[[int, bytes], bool]
+EmbCancelCallbackType: TypeAlias = 'Callable[[list[int], str], bool]'
 
 
 def empty_response_callback(token_id: int, response: str) -> bool:
@@ -169,6 +181,10 @@ class Sentinel(Enum):
 class EmbedResult(Generic[EmbeddingsType], TypedDict):
     embeddings: EmbeddingsType
     n_prompt_tokens: int
+
+
+class CancellationError(Exception):
+    """raised when embedding is canceled"""
 
 
 class LLModel:
@@ -213,6 +229,19 @@ class LLModel:
 
     def _raise_closed(self) -> NoReturn:
         raise ValueError("Attempted operation on a closed LLModel")
+
+    @property
+    def backend(self) -> Literal["cpu", "kompute", "metal"]:
+        if self.model is None:
+            self._raise_closed()
+        return llmodel.llmodel_model_backend_name(self.model).decode()
+
+    @property
+    def device(self) -> str | None:
+        if self.model is None:
+            self._raise_closed()
+        dev = llmodel.llmodel_model_gpu_device_name(self.model)
+        return None if dev is None else dev.decode()
 
     @staticmethod
     def list_gpus(mem_required: int = 0) -> list[str]:
@@ -323,19 +352,23 @@ class LLModel:
 
     @overload
     def generate_embeddings(
-        self, text: str, prefix: str, dimensionality: int, do_mean: bool, atlas: bool,
+        self, text: str, prefix: str | None, dimensionality: int, do_mean: bool, atlas: bool,
+        cancel_cb: EmbCancelCallbackType | None,
     ) -> EmbedResult[list[float]]: ...
     @overload
     def generate_embeddings(
         self, text: list[str], prefix: str | None, dimensionality: int, do_mean: bool, atlas: bool,
+        cancel_cb: EmbCancelCallbackType | None,
     ) -> EmbedResult[list[list[float]]]: ...
     @overload
     def generate_embeddings(
         self, text: str | list[str], prefix: str | None, dimensionality: int, do_mean: bool, atlas: bool,
+        cancel_cb: EmbCancelCallbackType | None,
     ) -> EmbedResult[list[Any]]: ...
 
     def generate_embeddings(
         self, text: str | list[str], prefix: str | None, dimensionality: int, do_mean: bool, atlas: bool,
+        cancel_cb: EmbCancelCallbackType | None,
     ) -> EmbedResult[list[Any]]:
         if not text:
             raise ValueError("text must not be None or empty")
@@ -343,7 +376,7 @@ class LLModel:
         if self.model is None:
             self._raise_closed()
 
-        if (single_text := isinstance(text, str)):
+        if single_text := isinstance(text, str):
             text = [text]
 
         # prepare input
@@ -355,14 +388,22 @@ class LLModel:
         for i, t in enumerate(text):
             c_texts[i] = t.encode()
 
+        def wrap_cancel_cb(batch_sizes: Any, n_batch: int, backend: bytes) -> bool:
+            assert cancel_cb is not None
+            return cancel_cb(batch_sizes[:n_batch], backend.decode())
+
+        cancel_cb_wrapper = EmbCancelCallback() if cancel_cb is None else EmbCancelCallback(wrap_cancel_cb)
+
         # generate the embeddings
         embedding_ptr = llmodel.llmodel_embed(
             self.model, c_texts, ctypes.byref(embedding_size), c_prefix, dimensionality, ctypes.byref(token_count),
-            do_mean, atlas, ctypes.byref(error),
+            do_mean, atlas, cancel_cb_wrapper, ctypes.byref(error),
         )
 
         if not embedding_ptr:
             msg = "(unknown error)" if error.value is None else error.value.decode()
+            if msg == "operation was canceled":
+                raise CancellationError(msg)
             raise RuntimeError(f'Failed to generate embeddings: {msg}')
 
         # extract output
