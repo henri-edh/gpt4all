@@ -1,13 +1,28 @@
 #ifndef CHATLLM_H
 #define CHATLLM_H
 
-#include <QObject>
-#include <QThread>
-#include <QFileInfo>
-
-#include "database.h"
+#include "database.h" // IWYU pragma: keep
 #include "modellist.h"
+
 #include "../gpt4all-backend/llmodel.h"
+
+#include <QByteArray>
+#include <QElapsedTimer>
+#include <QFileInfo>
+#include <QList>
+#include <QObject>
+#include <QPair>
+#include <QString>
+#include <QThread>
+#include <QVector>
+#include <QtGlobal>
+
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <string>
+
+class QDataStream;
 
 enum LLModelType {
     GPTJ_,
@@ -16,7 +31,7 @@ enum LLModelType {
 };
 
 struct LLModelInfo {
-    LLModel *model = nullptr;
+    std::unique_ptr<LLModel> model;
     QFileInfo fileInfo;
     // NOTE: This does not store the model type or name on purpose as this is left for ChatLLM which
     // must be able to serialize the information even if it is in the unloaded state
@@ -72,6 +87,7 @@ public:
     virtual ~ChatLLM();
 
     void destroy();
+    static void destroyStore();
     bool isModelLoaded() const;
     void regenerateResponse();
     void resetResponse();
@@ -81,7 +97,7 @@ public:
 
     bool shouldBeLoaded() const { return m_shouldBeLoaded; }
     void setShouldBeLoaded(bool b);
-    void setShouldTrySwitchContext(bool b);
+    void requestTrySwitchContext();
     void setForceUnloadModel(bool b) { m_forceUnloadModel = b; }
     void setMarkedForDeletion(bool b) { m_markedForDeletion = b; }
 
@@ -101,7 +117,7 @@ public:
 public Q_SLOTS:
     bool prompt(const QList<QString> &collectionList, const QString &prompt);
     bool loadDefaultModel();
-    bool trySwitchContextOfLoadedModel(const ModelInfo &modelInfo);
+    void trySwitchContextOfLoadedModel(const ModelInfo &modelInfo);
     bool loadModel(const ModelInfo &modelInfo);
     void modelChangeRequested(const ModelInfo &modelInfo);
     void unloadModel();
@@ -109,7 +125,6 @@ public Q_SLOTS:
     void generateName();
     void handleChatIdChanged(const QString &id);
     void handleShouldBeLoadedChanged();
-    void handleShouldTrySwitchContextChanged();
     void handleThreadStarted();
     void handleForceMetalChanged(bool forceMetal);
     void handleDeviceChanged();
@@ -123,15 +138,13 @@ Q_SIGNALS:
     void modelLoadingWarning(const QString &warning);
     void responseChanged(const QString &response);
     void promptProcessing();
-    void responseStopped();
-    void sendStartup();
-    void sendModelLoaded();
+    void responseStopped(qint64 promptResponseMs);
     void generatedNameChanged(const QString &name);
     void stateChanged();
     void threadStarted();
     void shouldBeLoadedChanged();
-    void shouldTrySwitchContextChanged();
-    void trySwitchContextOfLoadedModelCompleted(bool);
+    void trySwitchContextRequested(const ModelInfo &modelInfo);
+    void trySwitchContextOfLoadedModelCompleted(int value);
     void requestRetrieveFromDB(const QList<QString> &collections, const QString &text, int retrievalSize, QList<ResultInfo> *results);
     void reportSpeed(const QString &speed);
     void reportDevice(const QString &device);
@@ -174,7 +187,6 @@ private:
     QThread m_llmThread;
     std::atomic<bool> m_stopGenerating;
     std::atomic<bool> m_shouldBeLoaded;
-    std::atomic<bool> m_shouldTrySwitchContext;
     std::atomic<bool> m_isRecalc;
     std::atomic<bool> m_forceUnloadModel;
     std::atomic<bool> m_markedForDeletion;
@@ -183,6 +195,10 @@ private:
     bool m_reloadingToChangeVariant;
     bool m_processedSystemPrompt;
     bool m_restoreStateFromText;
+    // m_pristineLoadedState is set if saveSate is unnecessary, either because:
+    // - an unload was queued during LLModel::restoreState()
+    // - the chat will be restored from text and hasn't been interacted with yet
+    bool m_pristineLoadedState = false;
     QVector<QPair<QString, QString>> m_stateFromText;
 };
 

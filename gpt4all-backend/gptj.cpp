@@ -1,33 +1,28 @@
 #define GPTJ_H_I_KNOW_WHAT_I_AM_DOING_WHEN_INCLUDING_THIS_FILE
 #include "gptj_impl.h"
 
-#include "utils.h"
+#include "llmodel.h"
 #include "llmodel_shared.h"
+#include "utils.h"
 
+#include <ggml.h>
+
+#include <algorithm>
 #include <cassert>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <map>
-#include <string>
-#include <vector>
+#include <ctime>
 #include <iostream>
-#if defined(_WIN32) && defined(_MSC_VER)
-    #define WIN32_LEAN_AND_MEAN
-    #ifndef NOMINMAX
-        #define NOMINMAX
-    #endif
-    #include <windows.h>
-    #include <io.h>
-    #include <stdio.h>
-#else
-    #include <unistd.h>
-#endif
+#include <map>
+#include <memory>
+#include <random>
 #include <sstream>
-#include <unordered_set>
-#include <ggml.h>
-
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
 
 namespace {
 const char *modelType_ = "GPT-J";
@@ -785,13 +780,15 @@ const std::vector<LLModel::Token> &GPTJ::endTokens() const
     return fres;
 }
 
-std::string get_arch_name(gguf_context *ctx_gguf) {
-    std::string arch_name;
+const char *get_arch_name(gguf_context *ctx_gguf) {
     const int kid = gguf_find_key(ctx_gguf, "general.architecture");
+    if (kid == -1)
+        throw std::runtime_error("key not found in model: general.architecture");
+
     enum gguf_type ktype = gguf_get_kv_type(ctx_gguf, kid);
-    if (ktype != GGUF_TYPE_STRING) {
-        throw std::runtime_error("ERROR: Can't get general architecture from gguf file.");
-    }
+    if (ktype != GGUF_TYPE_STRING)
+        throw std::runtime_error("key general.architecture has wrong type");
+
     return gguf_get_val_str(ctx_gguf, kid);
 }
 
@@ -814,21 +811,29 @@ DLL_EXPORT const char *get_build_variant() {
     return GGML_BUILD_VARIANT;
 }
 
-DLL_EXPORT bool magic_match(const char * fname) {
+DLL_EXPORT char *get_file_arch(const char *fname) {
     struct ggml_context * ctx_meta = NULL;
     struct gguf_init_params params = {
         /*.no_alloc = */ true,
         /*.ctx      = */ &ctx_meta,
     };
     gguf_context *ctx_gguf = gguf_init_from_file(fname, params);
-    if (!ctx_gguf)
-        return false;
 
-    bool isValid = gguf_get_version(ctx_gguf) <= 3;
-    isValid = isValid && get_arch_name(ctx_gguf) == "gptj";
+    char *arch = nullptr;
+    if (ctx_gguf && gguf_get_version(ctx_gguf) <= 3) {
+        try {
+            arch = strdup(get_arch_name(ctx_gguf));
+        } catch (const std::runtime_error &) {
+            // cannot read key -> return null
+        }
+    }
 
     gguf_free(ctx_gguf);
-    return isValid;
+    return arch;
+}
+
+DLL_EXPORT bool is_arch_supported(const char *arch) {
+    return !strcmp(arch, "gptj");
 }
 
 DLL_EXPORT LLModel *construct() {

@@ -1,8 +1,22 @@
 #ifndef CHATLISTMODEL_H
 #define CHATLISTMODEL_H
 
-#include <QAbstractListModel>
 #include "chat.h"
+#include "chatllm.h"
+#include "chatmodel.h"
+
+#include <QAbstractListModel>
+#include <QByteArray>
+#include <QDebug>
+#include <QHash>
+#include <QList>
+#include <QObject>
+#include <QThread>
+#include <QVariant>
+#include <QVector>
+#include <Qt>
+#include <QtGlobal>
+#include <QtLogging>
 
 class ChatsRestoreThread : public QThread
 {
@@ -81,11 +95,15 @@ public:
     bool shouldSaveChatGPTChats() const;
     void setShouldSaveChatGPTChats(bool b);
 
+    Q_INVOKABLE void loadChats();
+
     Q_INVOKABLE void addChat()
     {
-        // Don't add a new chat if we already have one
-        if (m_newChat)
+        // Select the existing new chat if we already have one
+        if (m_newChat) {
+            setCurrentChat(m_newChat);
             return;
+        }
 
         // Create a new chat pointer and connect it to determine when it is populated
         m_newChat = new Chat(this);
@@ -112,20 +130,6 @@ public:
         m_chats.append(m_serverChat);
         endInsertRows();
         emit countChanged();
-    }
-
-    void setNewChat(Chat* chat)
-    {
-        // Don't add a new chat if we already have one
-        if (m_newChat)
-            return;
-
-        m_newChat = chat;
-        connect(m_newChat->chatModel(), &ChatModel::countChanged,
-            this, &ChatListModel::newChatCountChanged);
-        connect(m_newChat, &Chat::nameChanged,
-            this, &ChatListModel::nameChanged);
-        setCurrentChat(m_newChat);
     }
 
     Q_INVOKABLE void removeChat(Chat* chat)
@@ -195,7 +199,11 @@ public:
     int count() const { return m_chats.size(); }
 
     // stop ChatLLM threads for clean shutdown
-    void destroyChats() { for (auto *chat: m_chats) { chat->destroy(); } }
+    void destroyChats()
+    {
+        for (auto *chat: m_chats) { chat->destroy(); }
+        ChatLLM::destroyStore();
+    }
 
     void removeChatFile(Chat *chat) const;
     Q_INVOKABLE void saveChats();

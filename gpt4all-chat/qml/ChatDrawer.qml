@@ -39,8 +39,9 @@ Rectangle {
             text: qsTr("\uFF0B New chat")
             Accessible.description: qsTr("Create a new chat")
             onClicked: {
-                ChatListModel.addChat();
-                Network.sendNewChat(ChatListModel.count)
+                ChatListModel.addChat()
+                conversationList.positionViewAtIndex(0, ListView.Beginning)
+                Network.trackEvent("new_chat", {"number_of_chats": ChatListModel.count})
             }
         }
 
@@ -60,6 +61,9 @@ Rectangle {
                 anchors.fill: parent
                 anchors.rightMargin: 10
                 model: ChatListModel
+
+                Component.onCompleted: ChatListModel.loadChats()
+
                 ScrollBar.vertical: ScrollBar {
                     parent: conversationList.parent
                     anchors.top: conversationList.top
@@ -110,8 +114,8 @@ Rectangle {
                             // having focus
                             if (chatName.readOnly)
                                 return;
+                            Network.trackChatEvent("rename_chat")
                             changeName();
-                            Network.sendRenameChat()
                         }
                         function changeName() {
                             ChatListModel.get(index).name = chatName.text
@@ -194,8 +198,8 @@ Rectangle {
                                     color: "transparent"
                                 }
                                 onClicked: {
+                                    Network.trackChatEvent("remove_chat")
                                     ChatListModel.removeChat(ChatListModel.get(index))
-                                    Network.sendRemoveChat()
                                 }
                                 Accessible.role: Accessible.Button
                                 Accessible.name: qsTr("Confirm chat deletion")

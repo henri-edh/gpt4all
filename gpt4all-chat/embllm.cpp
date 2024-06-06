@@ -1,10 +1,37 @@
 #include "embllm.h"
+
 #include "modellist.h"
+
+#include "../gpt4all-backend/llmodel.h"
+
+#include <QCoreApplication>
+#include <QDebug>
+#include <QFile>
+#include <QFileInfo>
+#include <QGuiApplication>
+#include <QIODevice>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonValue>
+#include <QList>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QUrl>
+#include <Qt>
+#include <QtGlobal>
+#include <QtLogging>
+
+#include <exception>
+#include <string>
+#include <utility>
 
 EmbeddingLLMWorker::EmbeddingLLMWorker()
     : QObject(nullptr)
     , m_networkManager(new QNetworkAccessManager(this))
     , m_model(nullptr)
+    , m_stopGenerating(false)
 {
     moveToThread(&m_workerThread);
     connect(this, &EmbeddingLLMWorker::finished, &m_workerThread, &QThread::quit, Qt::DirectConnection);
@@ -14,6 +41,10 @@ EmbeddingLLMWorker::EmbeddingLLMWorker()
 
 EmbeddingLLMWorker::~EmbeddingLLMWorker()
 {
+    m_stopGenerating = true;
+    m_workerThread.quit();
+    m_workerThread.wait();
+
     if (m_model) {
         delete m_model;
         m_model = nullptr;
@@ -57,7 +88,14 @@ bool EmbeddingLLMWorker::loadModel()
         return true;
     }
 
-    m_model = LLModel::Implementation::construct(filePath.toStdString());
+    try {
+        m_model = LLModel::Implementation::construct(filePath.toStdString());
+    } catch (const std::exception &e) {
+        qWarning() << "WARNING: Could not load embedding model:" << e.what();
+        m_model = nullptr;
+        return false;
+    }
+
     // NOTE: explicitly loads model on CPU to avoid GPU OOM
     // TODO(cebtenzzre): support GPU-accelerated embeddings
     bool success = m_model->loadModel(filePath.toStdString(), 2048, 0);
@@ -90,16 +128,7 @@ bool EmbeddingLLMWorker::isNomic() const
 // this function is always called for retrieval tasks
 std::vector<float> EmbeddingLLMWorker::generateSyncEmbedding(const QString &text)
 {
-    if (!hasModel() && !loadModel()) {
-        qWarning() << "WARNING: Could not load model for embeddings";
-        return {};
-    }
-
-    if (isNomic()) {
-        qWarning() << "WARNING: Request to generate sync embeddings for non-local model invalid";
-        return {};
-    }
-
+    Q_ASSERT(!isNomic());
     std::vector<float> embedding(m_model->embeddingSize());
     try {
         m_model->embed({text.toStdString()}, embedding.data(), true);
@@ -125,7 +154,7 @@ void EmbeddingLLMWorker::sendAtlasRequest(const QStringList &texts, const QStrin
     request.setRawHeader("Authorization", authorization.toUtf8());
     request.setAttribute(QNetworkRequest::User, userData);
     QNetworkReply *reply = m_networkManager->post(request, doc.toJson(QJsonDocument::Compact));
-    connect(qApp, &QCoreApplication::aboutToQuit, reply, &QNetworkReply::abort);
+    connect(qGuiApp, &QCoreApplication::aboutToQuit, reply, &QNetworkReply::abort);
     connect(reply, &QNetworkReply::finished, this, &EmbeddingLLMWorker::handleFinished);
 }
 
@@ -150,6 +179,9 @@ void EmbeddingLLMWorker::requestSyncEmbedding(const QString &text)
 // this function is always called for storage into the database
 void EmbeddingLLMWorker::requestAsyncEmbedding(const QVector<EmbeddingChunk> &chunks)
 {
+    if (m_stopGenerating)
+        return;
+
     if (!hasModel() && !loadModel()) {
         qWarning() << "WARNING: Could not load model for embeddings";
         return;
@@ -299,16 +331,21 @@ EmbeddingLLM::~EmbeddingLLM()
 
 std::vector<float> EmbeddingLLM::generateEmbeddings(const QString &text)
 {
+    if (!m_embeddingWorker->hasModel() && !m_embeddingWorker->loadModel()) {
+        qWarning() << "WARNING: Could not load model for embeddings";
+        return {};
+    }
+
     if (!m_embeddingWorker->isNomic()) {
         return m_embeddingWorker->generateSyncEmbedding(text);
-    } else {
-        EmbeddingLLMWorker worker;
-        connect(this, &EmbeddingLLM::requestSyncEmbedding, &worker,
-            &EmbeddingLLMWorker::requestSyncEmbedding, Qt::QueuedConnection);
-        emit requestSyncEmbedding(text);
-        worker.wait();
-        return worker.lastResponse();
     }
+
+    EmbeddingLLMWorker worker;
+    connect(this, &EmbeddingLLM::requestSyncEmbedding, &worker,
+        &EmbeddingLLMWorker::requestSyncEmbedding, Qt::QueuedConnection);
+    emit requestSyncEmbedding(text);
+    worker.wait();
+    return worker.lastResponse();
 }
 
 void EmbeddingLLM::generateAsyncEmbeddings(const QVector<EmbeddingChunk> &chunks)

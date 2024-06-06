@@ -1,14 +1,19 @@
 #ifndef LLMODEL_H
 #define LLMODEL_H
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
-#include <fstream>
 #include <functional>
-#include <limits>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <utility>
 #include <vector>
+
+using namespace std::string_literals;
 
 #define LLMODEL_MAX_PROMPT_BATCH 128
 
@@ -17,15 +22,59 @@ class LLModel {
 public:
     using Token = int32_t;
 
+    class BadArchError: public std::runtime_error {
+    public:
+        BadArchError(std::string arch)
+            : runtime_error("Unsupported model architecture: " + arch)
+            , m_arch(std::move(arch))
+            {}
+
+        const std::string &arch() const noexcept { return m_arch; }
+
+    private:
+        std::string m_arch;
+    };
+
+    class MissingImplementationError: public std::runtime_error {
+    public:
+        using std::runtime_error::runtime_error;
+    };
+
+    class UnsupportedModelError: public std::runtime_error {
+    public:
+        using std::runtime_error::runtime_error;
+    };
+
     struct GPUDevice {
+        const char *backend;
         int index;
         int type;
         size_t heapSize;
         std::string name;
         std::string vendor;
 
-        GPUDevice(int index, int type, size_t heapSize, std::string name, std::string vendor):
-            index(index), type(type), heapSize(heapSize), name(std::move(name)), vendor(std::move(vendor)) {}
+        GPUDevice(const char *backend, int index, int type, size_t heapSize, std::string name, std::string vendor):
+            backend(backend), index(index), type(type), heapSize(heapSize), name(std::move(name)),
+            vendor(std::move(vendor)) {}
+
+        std::string selectionName() const { return m_backendNames.at(backend) + ": " + name; }
+        std::string reportedName()  const { return name + " (" + m_backendNames.at(backend) + ")"; }
+
+        static std::string updateSelectionName(const std::string &name) {
+            if (name == "Auto" || name == "CPU" || name == "Metal")
+                return name;
+            auto it = std::find_if(m_backendNames.begin(), m_backendNames.end(), [&name](const auto &entry) {
+                return name.starts_with(entry.second + ": ");
+            });
+            if (it != m_backendNames.end())
+                return name;
+            return "Vulkan: " + name; // previously, there were only Vulkan devices
+        }
+
+    private:
+        static inline const std::unordered_map<std::string, std::string> m_backendNames {
+            {"cuda", "CUDA"}, {"kompute", "Vulkan"},
+        };
     };
 
     class Implementation {
@@ -37,7 +86,7 @@ public:
         std::string_view modelType() const { return m_modelType; }
         std::string_view buildVariant() const { return m_buildVariant; }
 
-        static LLModel *construct(const std::string &modelPath, std::string buildVariant = "auto", int n_ctx = 2048);
+        static LLModel *construct(const std::string &modelPath, const std::string &backend = "auto", int n_ctx = 2048);
         static std::vector<GPUDevice> availableGPUDevices(size_t memoryRequired = 0);
         static int32_t maxContextLength(const std::string &modelPath);
         static int32_t layerCount(const std::string &modelPath);
@@ -45,15 +94,18 @@ public:
         static void setImplementationsSearchPath(const std::string &path);
         static const std::string &implementationsSearchPath();
         static bool hasSupportedCPU();
+        // 0 for no, 1 for yes, -1 for non-x86_64
+        static int cpuSupportsAVX2();
 
     private:
         Implementation(Dlhandle &&);
 
         static const std::vector<Implementation> &implementationList();
         static const Implementation *implementation(const char *fname, const std::string &buildVariant);
-        static LLModel *constructDefaultLlama();
+        static LLModel *constructGlobalLlama(const std::optional<std::string> &backend = std::nullopt);
 
-        bool (*m_magicMatch)(const char *fname);
+        char *(*m_getFileArch)(const char *fname);
+        bool (*m_isArchSupported)(const char *arch);
         LLModel *(*m_construct)();
 
         std::string_view m_modelType;

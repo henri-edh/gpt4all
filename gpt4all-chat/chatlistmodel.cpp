@@ -1,8 +1,21 @@
 #include "chatlistmodel.h"
+
+#include "database.h" // IWYU pragma: keep
 #include "mysettings.h"
 
-#include <QFile>
 #include <QDataStream>
+#include <QDir>
+#include <QElapsedTimer>
+#include <QFile>
+#include <QFileInfo>
+#include <QGlobalStatic>
+#include <QGuiApplication>
+#include <QIODevice>
+#include <QSettings>
+#include <QString>
+#include <Qt>
+
+#include <algorithm>
 
 #define CHAT_FORMAT_MAGIC 0xF5D553CC
 #define CHAT_FORMAT_VERSION 7
@@ -15,18 +28,19 @@ ChatListModel *ChatListModel::globalInstance()
 }
 
 ChatListModel::ChatListModel()
-    : QAbstractListModel(nullptr)
+    : QAbstractListModel(nullptr) {}
+
+void ChatListModel::loadChats()
 {
     addChat();
 
     ChatsRestoreThread *thread = new ChatsRestoreThread;
-    connect(thread, &ChatsRestoreThread::chatRestored, this, &ChatListModel::restoreChat);
-    connect(thread, &ChatsRestoreThread::finished, this, &ChatListModel::chatsRestoredFinished);
+    connect(thread, &ChatsRestoreThread::chatRestored, this, &ChatListModel::restoreChat, Qt::QueuedConnection);
+    connect(thread, &ChatsRestoreThread::finished, this, &ChatListModel::chatsRestoredFinished, Qt::QueuedConnection);
     connect(thread, &ChatsRestoreThread::finished, thread, &QObject::deleteLater);
     thread->start();
 
     connect(MySettings::globalInstance(), &MySettings::serverChatChanged, this, &ChatListModel::handleServerEnabledChanged);
-
 }
 
 void ChatListModel::removeChatFile(Chat *chat) const
@@ -222,7 +236,7 @@ void ChatsRestoreThread::run()
         qDebug() << "deserializing chat" << f.file;
 
         Chat *chat = new Chat;
-        chat->moveToThread(qApp->thread());
+        chat->moveToThread(qGuiApp->thread());
         if (!chat->deserialize(in, version)) {
             qWarning() << "ERROR: Couldn't deserialize chat from file:" << file.fileName();
         } else {

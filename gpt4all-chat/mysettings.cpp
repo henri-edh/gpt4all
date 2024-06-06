@@ -1,13 +1,24 @@
 #include "mysettings.h"
-#include "modellist.h"
+
 #include "../gpt4all-backend/llmodel.h"
 
+#include <QDebug>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QGlobalStatic>
+#include <QIODevice>
 #include <QSettings>
 #include <QStandardPaths>
+#include <QThread>
+#include <QtLogging>
 #include <QUrl>
+#include <QVariant>
+
+#include <algorithm>
+#include <string>
+#include <thread>
+#include <vector>
 
 static int      default_threadCount         = std::min(4, (int32_t) std::thread::hardware_concurrency());
 static bool     default_saveChatsContext    = false;
@@ -65,10 +76,14 @@ MySettings::MySettings()
 {
     QSettings::setDefaultFormat(QSettings::IniFormat);
 
-    std::vector<LLModel::GPUDevice> devices = LLModel::Implementation::availableGPUDevices();
     QVector<QString> deviceList{ "Auto" };
+#if defined(Q_OS_MAC) && defined(__aarch64__)
+    deviceList << "Metal";
+#else
+    std::vector<LLModel::GPUDevice> devices = LLModel::Implementation::availableGPUDevices();
     for (LLModel::GPUDevice &d : devices)
-        deviceList << QString::fromStdString(d.name);
+        deviceList << QString::fromStdString(d.selectionName());
+#endif
     deviceList << "CPU";
     setDeviceList(deviceList);
 }
@@ -786,7 +801,23 @@ QString MySettings::device() const
 {
     QSettings setting;
     setting.sync();
-    return setting.value("device", default_device).toString();
+    auto value = setting.value("device");
+    if (!value.isValid())
+        return default_device;
+
+    auto device = value.toString();
+    if (!device.isEmpty()) {
+        auto deviceStr = device.toStdString();
+        auto newNameStr = LLModel::GPUDevice::updateSelectionName(deviceStr);
+        if (newNameStr != deviceStr) {
+            auto newName = QString::fromStdString(newNameStr);
+            qWarning() << "updating device name:" << device << "->" << newName;
+            device = newName;
+            setting.setValue("device", device);
+            setting.sync();
+        }
+    }
+    return device;
 }
 
 void MySettings::setDevice(const QString &u)
@@ -910,15 +941,23 @@ bool MySettings::networkIsActive() const
     return setting.value("network/isActive", default_networkIsActive).toBool();
 }
 
+bool MySettings::isNetworkIsActiveSet() const
+{
+    QSettings setting;
+    setting.sync();
+    return setting.value("network/isActive").isValid();
+}
+
 void MySettings::setNetworkIsActive(bool b)
 {
-    if (networkIsActive() == b)
-        return;
-
     QSettings setting;
-    setting.setValue("network/isActive", b);
     setting.sync();
-    emit networkIsActiveChanged();
+    auto cur = setting.value("network/isActive");
+    if (!cur.isValid() || cur.toBool() != b) {
+        setting.setValue("network/isActive", b);
+        setting.sync();
+        emit networkIsActiveChanged();
+    }
 }
 
 bool MySettings::networkUsageStatsActive() const
@@ -928,13 +967,21 @@ bool MySettings::networkUsageStatsActive() const
     return setting.value("network/usageStatsActive", default_networkUsageStatsActive).toBool();
 }
 
+bool MySettings::isNetworkUsageStatsActiveSet() const
+{
+    QSettings setting;
+    setting.sync();
+    return setting.value("network/usageStatsActive").isValid();
+}
+
 void MySettings::setNetworkUsageStatsActive(bool b)
 {
-    if (networkUsageStatsActive() == b)
-        return;
-
     QSettings setting;
-    setting.setValue("network/usageStatsActive", b);
     setting.sync();
-    emit networkUsageStatsActiveChanged();
+    auto cur = setting.value("network/usageStatsActive");
+    if (!cur.isValid() || cur.toBool() != b) {
+        setting.setValue("network/usageStatsActive", b);
+        setting.sync();
+        emit networkUsageStatsActiveChanged();
+    }
 }

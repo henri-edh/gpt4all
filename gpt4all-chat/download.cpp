@@ -1,18 +1,35 @@
 #include "download.h"
-#include "network.h"
+
 #include "modellist.h"
 #include "mysettings.h"
+#include "network.h"
 
+#include <QByteArray>
 #include <QCoreApplication>
-#include <QNetworkRequest>
-#include <QNetworkAccessManager>
+#include <QDebug>
+#include <QGlobalStatic>
+#include <QGuiApplication>
+#include <QIODevice>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QJsonArray>
-#include <QUrl>
-#include <QDir>
-#include <QStandardPaths>
+#include <QJsonValue>
+#include <QNetworkRequest>
+#include <QPair>
 #include <QSettings>
+#include <QSslConfiguration>
+#include <QSslSocket>
+#include <QStringList>
+#include <QTextStream>
+#include <QUrl>
+#include <QVariant>
+#include <QVector>
+#include <Qt>
+#include <QtLogging>
+
+#include <algorithm>
+#include <cstddef>
+#include <utility>
 
 class MyDownload: public Download { };
 Q_GLOBAL_STATIC(MyDownload, downloadInstance)
@@ -75,15 +92,25 @@ bool Download::hasNewerRelease() const
     return compareVersions(versions.first(), currentVersion);
 }
 
-bool Download::isFirstStart() const
+bool Download::isFirstStart(bool writeVersion) const
 {
+    auto *mySettings = MySettings::globalInstance();
+
     QSettings settings;
     settings.sync();
     QString lastVersionStarted = settings.value("download/lastVersionStarted").toString();
     bool first = lastVersionStarted != QCoreApplication::applicationVersion();
-    settings.setValue("download/lastVersionStarted", QCoreApplication::applicationVersion());
-    settings.sync();
-    return first;
+    if (first && writeVersion) {
+        settings.setValue("download/lastVersionStarted", QCoreApplication::applicationVersion());
+        // let the user select these again
+        settings.remove("network/usageStatsActive");
+        settings.remove("network/isActive");
+        settings.sync();
+        emit mySettings->networkUsageStatsActiveChanged();
+        emit mySettings->networkIsActiveChanged();
+    }
+
+    return first || !mySettings->isNetworkUsageStatsActiveSet() || !mySettings->isNetworkIsActiveSet();
 }
 
 void Download::updateReleaseNotes()
@@ -94,7 +121,7 @@ void Download::updateReleaseNotes()
     conf.setPeerVerifyMode(QSslSocket::VerifyNone);
     request.setSslConfiguration(conf);
     QNetworkReply *jsonReply = m_networkManager.get(request);
-    connect(qApp, &QCoreApplication::aboutToQuit, jsonReply, &QNetworkReply::abort);
+    connect(qGuiApp, &QCoreApplication::aboutToQuit, jsonReply, &QNetworkReply::abort);
     connect(jsonReply, &QNetworkReply::finished, this, &Download::handleReleaseJsonDownloadFinished);
 }
 
@@ -131,7 +158,7 @@ void Download::downloadModel(const QString &modelFile)
     ModelList::globalInstance()->updateDataByFilename(modelFile, {{ ModelList::DownloadingRole, true }});
     ModelInfo info = ModelList::globalInstance()->modelInfoByFilename(modelFile);
     QString url = !info.url().isEmpty() ? info.url() : "http://gpt4all.io/models/gguf/" + modelFile;
-    Network::globalInstance()->sendDownloadStarted(modelFile);
+    Network::globalInstance()->trackEvent("download_started", { {"model", modelFile} });
     QNetworkRequest request(url);
     request.setAttribute(QNetworkRequest::User, modelFile);
     request.setRawHeader("range", QString("bytes=%1-").arg(tempFile->pos()).toUtf8());
@@ -139,7 +166,7 @@ void Download::downloadModel(const QString &modelFile)
     conf.setPeerVerifyMode(QSslSocket::VerifyNone);
     request.setSslConfiguration(conf);
     QNetworkReply *modelReply = m_networkManager.get(request);
-    connect(qApp, &QCoreApplication::aboutToQuit, modelReply, &QNetworkReply::abort);
+    connect(qGuiApp, &QCoreApplication::aboutToQuit, modelReply, &QNetworkReply::abort);
     connect(modelReply, &QNetworkReply::downloadProgress, this, &Download::handleDownloadProgress);
     connect(modelReply, &QNetworkReply::errorOccurred, this, &Download::handleErrorOccurred);
     connect(modelReply, &QNetworkReply::finished, this, &Download::handleModelDownloadFinished);
@@ -153,7 +180,7 @@ void Download::cancelDownload(const QString &modelFile)
         QNetworkReply *modelReply = m_activeDownloads.keys().at(i);
         QUrl url = modelReply->request().url();
         if (url.toString().endsWith(modelFile)) {
-            Network::globalInstance()->sendDownloadCanceled(modelFile);
+            Network::globalInstance()->trackEvent("download_canceled", { {"model", modelFile} });
 
             // Disconnect the signals
             disconnect(modelReply, &QNetworkReply::downloadProgress, this, &Download::handleDownloadProgress);
@@ -178,7 +205,8 @@ void Download::installModel(const QString &modelFile, const QString &apiKey)
     if (apiKey.isEmpty())
         return;
 
-    Network::globalInstance()->sendInstallModel(modelFile);
+    Network::globalInstance()->trackEvent("install_model", { {"model", modelFile} });
+
     QString filePath = MySettings::globalInstance()->modelPath() + modelFile;
     QFile file(filePath);
     if (file.open(QIODeviceBase::WriteOnly | QIODeviceBase::Text)) {
@@ -216,7 +244,7 @@ void Download::removeModel(const QString &modelFile)
         shouldRemoveInstalled = info.installed && !info.isClone() && (info.isDiscovered() || info.description() == "" /*indicates sideloaded*/);
         if (shouldRemoveInstalled)
             ModelList::globalInstance()->removeInstalled(info);
-        Network::globalInstance()->sendRemoveModel(modelFile);
+        Network::globalInstance()->trackEvent("remove_model", { {"model", modelFile} });
         file.remove();
     }
 
@@ -332,7 +360,11 @@ void Download::handleErrorOccurred(QNetworkReply::NetworkError code)
             .arg(modelReply->errorString());
     qWarning() << error;
     ModelList::globalInstance()->updateDataByFilename(modelFilename, {{ ModelList::DownloadErrorRole, error }});
-    Network::globalInstance()->sendDownloadError(modelFilename, (int)code, modelReply->errorString());
+    Network::globalInstance()->trackEvent("download_error", {
+        {"model", modelFilename},
+        {"code", (int)code},
+        {"error", modelReply->errorString()},
+    });
     cancelDownload(modelFilename);
 }
 
@@ -515,7 +547,7 @@ void Download::handleHashAndSaveFinished(bool success, const QString &error,
     // The hash and save should send back with tempfile closed
     Q_ASSERT(!tempFile->isOpen());
     QString modelFilename = modelReply->request().attribute(QNetworkRequest::User).toString();
-    Network::globalInstance()->sendDownloadFinished(modelFilename, success);
+    Network::globalInstance()->trackEvent("download_finished", { {"model", modelFilename}, {"success", success} });
 
     QVector<QPair<int, QVariant>> data {
         { ModelList::CalcHashRole, false },

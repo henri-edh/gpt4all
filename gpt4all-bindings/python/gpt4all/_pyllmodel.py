@@ -28,6 +28,27 @@ if TYPE_CHECKING:
 EmbeddingsType = TypeVar('EmbeddingsType', bound='list[Any]')
 
 
+# Find CUDA libraries from the official packages
+cuda_found = False
+if platform.system() in ('Linux', 'Windows'):
+    try:
+        from nvidia import cuda_runtime, cublas
+    except ImportError:
+        pass  # CUDA is optional
+    else:
+        if platform.system() == 'Linux':
+            cudalib   = 'lib/libcudart.so.12'
+            cublaslib = 'lib/libcublas.so.12'
+        else:  # Windows
+            cudalib   = r'bin\cudart64_12.dll'
+            cublaslib = r'bin\cublas64_12.dll'
+
+        # preload the CUDA libs so the backend can find them
+        ctypes.CDLL(os.path.join(cuda_runtime.__path__[0], cudalib), mode=ctypes.RTLD_GLOBAL)
+        ctypes.CDLL(os.path.join(cublas.__path__[0], cublaslib), mode=ctypes.RTLD_GLOBAL)
+        cuda_found = True
+
+
 # TODO: provide a config file to make this more robust
 MODEL_LIB_PATH = importlib_resources.files("gpt4all") / "llmodel_DO_NOT_MODIFY" / "build"
 
@@ -71,6 +92,7 @@ class LLModelPromptContext(ctypes.Structure):
 
 class LLModelGPUDevice(ctypes.Structure):
     _fields_ = [
+        ("backend", ctypes.c_char_p),
         ("index", ctypes.c_int32),
         ("type", ctypes.c_int32),
         ("heapSize", ctypes.c_size_t),
@@ -200,9 +222,11 @@ class LLModel:
         Maximum size of context window
     ngl : int
         Number of GPU layers to use (Vulkan)
+    backend : str
+        Backend to use. One of 'auto', 'cpu', 'metal', 'kompute', or 'cuda'.
     """
 
-    def __init__(self, model_path: str, n_ctx: int, ngl: int):
+    def __init__(self, model_path: str, n_ctx: int, ngl: int, backend: str):
         self.model_path = model_path.encode()
         self.n_ctx = n_ctx
         self.ngl = ngl
@@ -212,10 +236,19 @@ class LLModel:
 
         # Construct a model implementation
         err = ctypes.c_char_p()
-        model = llmodel.llmodel_model_create2(self.model_path, b"auto", ctypes.byref(err))
+        model = llmodel.llmodel_model_create2(self.model_path, backend.encode(), ctypes.byref(err))
         if model is None:
             s = err.value
-            raise RuntimeError(f"Unable to instantiate model: {'null' if s is None else s.decode()}")
+            errmsg = 'null' if s is None else s.decode()
+
+            if (
+                backend == 'cuda'
+                and not cuda_found
+                and errmsg.startswith('Could not find any implementations for backend')
+            ):
+                print('WARNING: CUDA runtime libraries not found. Try `pip install "gpt4all[cuda]"`\n', file=sys.stderr)
+
+            raise RuntimeError(f"Unable to instantiate model: {errmsg}")
         self.model: ctypes.c_void_p | None = model
 
     def __del__(self, llmodel=llmodel):
@@ -231,7 +264,7 @@ class LLModel:
         raise ValueError("Attempted operation on a closed LLModel")
 
     @property
-    def backend(self) -> Literal["cpu", "kompute", "metal"]:
+    def backend(self) -> Literal["cpu", "kompute", "cuda", "metal"]:
         if self.model is None:
             self._raise_closed()
         return llmodel.llmodel_model_backend_name(self.model).decode()
@@ -258,7 +291,7 @@ class LLModel:
         devices_ptr = llmodel.llmodel_available_gpu_devices(mem_required, ctypes.byref(num_devices))
         if not devices_ptr:
             raise ValueError("Unable to retrieve available GPU devices")
-        return [d.name.decode() for d in devices_ptr[:num_devices.value]]
+        return [f'{d.backend.decode()}:{d.name.decode()}' for d in devices_ptr[:num_devices.value]]
 
     def init_gpu(self, device: str):
         if self.model is None:
@@ -271,11 +304,12 @@ class LLModel:
 
         all_gpus = self.list_gpus()
         available_gpus = self.list_gpus(mem_required)
-        unavailable_gpus = set(all_gpus).difference(available_gpus)
+        unavailable_gpus = [g for g in all_gpus if g not in available_gpus]
 
-        error_msg = "Unable to initialize model on GPU: {!r}".format(device)
-        error_msg += "\nAvailable GPUs: {}".format(available_gpus)
-        error_msg += "\nUnavailable GPUs due to insufficient memory or features: {}".format(unavailable_gpus)
+        error_msg = (f"Unable to initialize model on GPU: {device!r}" +
+                     f"\nAvailable GPUs: {available_gpus}")
+        if unavailable_gpus:
+            error_msg += f"\nUnavailable GPUs due to insufficient memory: {unavailable_gpus}"
         raise ValueError(error_msg)
 
     def load_model(self) -> bool:

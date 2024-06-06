@@ -1,10 +1,12 @@
 #ifndef LOCALDOCS_H
 #define LOCALDOCS_H
 
-#include "localdocsmodel.h"
-#include "database.h"
+#include "localdocsmodel.h" // IWYU pragma: keep
 
 #include <QObject>
+#include <QString>
+
+class Database;
 
 class LocalDocs : public QObject
 {
@@ -26,7 +28,8 @@ public Q_SLOTS:
     void aboutToQuit();
 
 Q_SIGNALS:
-    void requestAddFolder(const QString &collection, const QString &path);
+    void requestStart();
+    void requestAddFolder(const QString &collection, const QString &path, bool fromDb);
     void requestRemoveFolder(const QString &collection, const QString &path);
     void requestChunkSizeChange(int chunkSize);
     void localDocsModelChanged();

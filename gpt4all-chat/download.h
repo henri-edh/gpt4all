@@ -1,13 +1,21 @@
 #ifndef DOWNLOAD_H
 #define DOWNLOAD_H
 
-#include <QObject>
+#include <QCryptographicHash>
+#include <QDateTime>
+#include <QFile>
+#include <QHash>
+#include <QList>
+#include <QMap>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
-#include <QFile>
-#include <QVariant>
-#include <QTemporaryFile>
+#include <QObject>
+#include <QSslError>
+#include <QString>
 #include <QThread>
+#include <QtGlobal>
+
+class QByteArray;
 
 struct ReleaseInfo {
     Q_GADGET
@@ -54,7 +62,7 @@ public:
     Q_INVOKABLE void cancelDownload(const QString &modelFile);
     Q_INVOKABLE void installModel(const QString &modelFile, const QString &apiKey);
     Q_INVOKABLE void removeModel(const QString &modelFile);
-    Q_INVOKABLE bool isFirstStart() const;
+    Q_INVOKABLE bool isFirstStart(bool writeVersion = false) const;
 
 public Q_SLOTS:
     void updateReleaseNotes();

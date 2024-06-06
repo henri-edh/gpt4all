@@ -1,16 +1,18 @@
+import Qt5Compat.GraphicalEffects
 import QtCore
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Basic
 import QtQuick.Layouts
-import Qt5Compat.GraphicalEffects
-import llm
+
 import chatlistmodel
 import download
-import modellist
-import network
 import gpt4all
+import llm
+import localdocs
+import modellist
 import mysettings
+import network
 
 Rectangle {
     id: window
@@ -27,6 +29,10 @@ Rectangle {
     // Startup code
     Component.onCompleted: {
         startupDialogs();
+    }
+
+    Component.onDestruction: {
+        Network.trackEvent("session_end")
     }
 
     Connections {
@@ -66,12 +72,12 @@ Rectangle {
     }
 
     property bool hasShownModelDownload: false
-    property bool hasShownFirstStart: false
+    property bool hasCheckedFirstStart: false
     property bool hasShownSettingsAccess: false
 
     function startupDialogs() {
         if (!LLM.compatHardware()) {
-            Network.sendNonCompatHardware();
+            Network.trackEvent("noncompat_hardware")
             errorCompatHardware.open();
             return;
         }
@@ -84,10 +90,18 @@ Rectangle {
         }
 
         // check for first time start of this version
-        if (!hasShownFirstStart && Download.isFirstStart()) {
-            firstStartDialog.open();
-            hasShownFirstStart = true;
-            return;
+        if (!hasCheckedFirstStart) {
+            if (Download.isFirstStart(/*writeVersion*/ true)) {
+                firstStartDialog.open();
+                return;
+            }
+
+            // send startup or opt-out now that the user has made their choice
+            Network.sendStartup()
+            // start localdocs
+            LocalDocs.requestStart()
+
+            hasCheckedFirstStart = true
         }
 
         // check for any current models and if not, open download dialog once
@@ -107,10 +121,6 @@ Rectangle {
     function currentModelName() {
         return ModelList.modelInfo(currentChat.modelInfo.id).name;
     }
-
-    property bool isCurrentlyLoading: false
-    property real modelLoadingPercentage: 0.0
-    property bool trySwitchContextInProgress: false
 
     PopupDialog {
         id: errorCompatHardware
@@ -326,34 +336,18 @@ Rectangle {
                     implicitWidth: 575
                     width: window.width >= 750 ? implicitWidth : implicitWidth - (750 - window.width)
                     enabled: !currentChat.isServer
-                        && !window.trySwitchContextInProgress
-                        && !window.isCurrentlyLoading
+                        && !currentChat.trySwitchContextInProgress
+                        && !currentChat.isCurrentlyLoading
                     model: ModelList.installedModels
                     valueRole: "id"
                     textRole: "name"
 
                     function changeModel(index) {
-                        window.modelLoadingPercentage = 0.0;
-                        window.isCurrentlyLoading = true;
                         currentChat.stopGenerating()
                         currentChat.reset();
                         currentChat.modelInfo = ModelList.modelInfo(comboBox.valueAt(index))
                     }
 
-                    Connections {
-                        target: currentChat
-                        function onModelLoadingPercentageChanged() {
-                            window.modelLoadingPercentage = currentChat.modelLoadingPercentage;
-                            window.isCurrentlyLoading = currentChat.modelLoadingPercentage !== 0.0
-                                && currentChat.modelLoadingPercentage !== 1.0;
-                        }
-                        function onTrySwitchContextOfLoadedModelAttempted() {
-                            window.trySwitchContextInProgress = true;
-                        }
-                        function onTrySwitchContextOfLoadedModelCompleted() {
-                            window.trySwitchContextInProgress = false;
-                        }
-                    }
                     Connections {
                         target: switchModelDialog
                         function onAccepted() {
@@ -363,14 +357,14 @@ Rectangle {
 
                     background: ProgressBar {
                         id: modelProgress
-                        value: window.modelLoadingPercentage
+                        value: currentChat.modelLoadingPercentage
                         background: Rectangle {
                             color: theme.mainComboBackground
                             radius: 10
                         }
                         contentItem: Item {
                             Rectangle {
-                                visible: window.isCurrentlyLoading
+                                visible: currentChat.isCurrentlyLoading
                                 anchors.bottom: parent.bottom
                                 width: modelProgress.visualPosition * parent.width
                                 height: 10
@@ -392,13 +386,15 @@ Rectangle {
                         text: {
                             if (currentChat.modelLoadingError !== "")
                                 return qsTr("Model loading error...")
-                            if (window.trySwitchContextInProgress)
+                            if (currentChat.trySwitchContextInProgress == 1)
+                                return qsTr("Waiting for model...")
+                            if (currentChat.trySwitchContextInProgress == 2)
                                 return qsTr("Switching context...")
                             if (currentModelName() === "")
                                 return qsTr("Choose a model...")
                             if (currentChat.modelLoadingPercentage === 0.0)
                                 return qsTr("Reload \u00B7 ") + currentModelName()
-                            if (window.isCurrentlyLoading)
+                            if (currentChat.isCurrentlyLoading)
                                 return qsTr("Loading \u00B7 ") + currentModelName()
                             return currentModelName()
                         }
@@ -442,7 +438,7 @@ Rectangle {
 
                     MyMiniButton {
                         id: ejectButton
-                        visible: currentChat.isModelLoaded && !window.isCurrentlyLoading
+                        visible: currentChat.isModelLoaded && !currentChat.isCurrentlyLoading
                         z: 500
                         anchors.right: parent.right
                         anchors.rightMargin: 50
@@ -460,8 +456,8 @@ Rectangle {
                     MyMiniButton {
                         id: reloadButton
                         visible: currentChat.modelLoadingError === ""
-                            && !window.trySwitchContextInProgress
-                            && !window.isCurrentlyLoading
+                            && !currentChat.trySwitchContextInProgress
+                            && !currentChat.isCurrentlyLoading
                             && (currentChat.isModelLoaded || currentModelName() !== "")
                         z: 500
                         anchors.right: ejectButton.visible ? ejectButton.left : parent.right
@@ -547,7 +543,6 @@ Rectangle {
         onClicked: {
             if (MySettings.networkIsActive) {
                 MySettings.networkIsActive = false
-                Network.sendNetworkToggled(false);
             } else
                 networkDialog.open()
         }
@@ -733,7 +728,7 @@ Rectangle {
         Accessible.description: qsTr("Reset the context and erase current conversation")
 
         onClicked: {
-            Network.sendResetContext(chatModel.count)
+            Network.trackChatEvent("reset_context", { "length": chatModel.count })
             currentChat.reset();
             currentChat.processSystemPrompt();
         }
@@ -1056,7 +1051,7 @@ Rectangle {
                             anchors.fill: parent
                             acceptedButtons: Qt.RightButton
 
-                            onClicked: {
+                            onClicked: (mouse) => {
                                 if (mouse.button === Qt.RightButton) {
                                     conversationContextMenu.x = conversationMouseArea.mouseX
                                     conversationContextMenu.y = conversationMouseArea.mouseY
@@ -1069,11 +1064,19 @@ Rectangle {
                             id: conversationContextMenu
                             MenuItem {
                                 text: qsTr("Copy")
+                                enabled: myTextArea.selectedText !== ""
+                                height: enabled ? implicitHeight : 0
                                 onTriggered: myTextArea.copy()
                             }
                             MenuItem {
-                                text: qsTr("Select All")
-                                onTriggered: myTextArea.selectAll()
+                                text: qsTr("Copy Message")
+                                enabled: myTextArea.selectedText === ""
+                                height: enabled ? implicitHeight : 0
+                                onTriggered: {
+                                    myTextArea.selectAll()
+                                    myTextArea.copy()
+                                    myTextArea.deselect()
+                                }
                             }
                         }
 
@@ -1288,9 +1291,11 @@ Rectangle {
                     var listElement = chatModel.get(index);
 
                     if (currentChat.responseInProgress) {
+                        Network.trackChatEvent("stop_generating_clicked")
                         listElement.stopped = true
                         currentChat.stopGenerating()
                     } else {
+                        Network.trackChatEvent("regenerate_clicked")
                         currentChat.regenerateResponse()
                         if (chatModel.count) {
                             if (listElement.name === qsTr("Response: ")) {
@@ -1321,8 +1326,9 @@ Rectangle {
                 textColor: theme.textColor
                 visible: !currentChat.isServer
                     && !currentChat.isModelLoaded
-                    && !window.trySwitchContextInProgress
-                    && !window.isCurrentlyLoading
+                    && currentChat.modelLoadingError === ""
+                    && !currentChat.trySwitchContextInProgress
+                    && !currentChat.isCurrentlyLoading
                     && currentModelName() !== ""
 
                 Image {
@@ -1393,11 +1399,11 @@ Rectangle {
                 Accessible.role: Accessible.EditableText
                 Accessible.name: placeholderText
                 Accessible.description: qsTr("Send messages/prompts to the model")
-                Keys.onReturnPressed: (event)=> {
-                    if (event.modifiers & Qt.ControlModifier || event.modifiers & Qt.ShiftModifier)
-                        event.accepted = false;
-                    else {
-                        editingFinished();
+                Keys.onReturnPressed: (event) => {
+                    if (event.modifiers & Qt.ControlModifier || event.modifiers & Qt.ShiftModifier) {
+                        event.accepted = false
+                    } else if (!currentChat.responseInProgress) {
+                        editingFinished()
                         sendMessage()
                     }
                 }
@@ -1405,6 +1411,7 @@ Rectangle {
                     if (textInput.text === "")
                         return
 
+                    Network.trackChatEvent("send_message")
                     currentChat.stopGenerating()
                     currentChat.newPromptResponsePair(textInput.text);
                     currentChat.prompt(textInput.text,
@@ -1425,7 +1432,7 @@ Rectangle {
                     anchors.fill: parent
                     acceptedButtons: Qt.RightButton
 
-                    onClicked: {
+                    onClicked: (mouse) => {
                         if (mouse.button === Qt.RightButton) {
                             textInputContextMenu.x = textInputMouseArea.mouseX
                             textInputContextMenu.y = textInputMouseArea.mouseY
@@ -1438,10 +1445,14 @@ Rectangle {
                     id: textInputContextMenu
                     MenuItem {
                         text: qsTr("Cut")
+                        enabled: textInput.selectedText !== ""
+                        height: enabled ? implicitHeight : 0
                         onTriggered: textInput.cut()
                     }
                     MenuItem {
                         text: qsTr("Copy")
+                        enabled: textInput.selectedText !== ""
+                        height: enabled ? implicitHeight : 0
                         onTriggered: textInput.copy()
                     }
                     MenuItem {
@@ -1466,6 +1477,7 @@ Rectangle {
             width: 30
             height: 30
             visible: !currentChat.isServer
+            enabled: !currentChat.responseInProgress
             source: "qrc:/gpt4all/icons/send_message.svg"
             Accessible.name: qsTr("Send message")
             Accessible.description: qsTr("Sends the message/prompt contained in textfield to the model")

@@ -4,11 +4,12 @@
 #ifndef LLAMAMODEL_H
 #define LLAMAMODEL_H
 
+#include "llmodel.h"
+
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
-#include "llmodel.h"
 
 struct LLamaPrivate;
 struct EmbModelSpec;
@@ -30,7 +31,7 @@ public:
     size_t restoreState(const uint8_t *src) override;
     void setThreadCount(int32_t n_threads) override;
     int32_t threadCount() const override;
-    std::vector<GPUDevice> availableGPUDevices(size_t memoryRequired) const override;
+    std::vector<GPUDevice> availableGPUDevices(size_t memoryRequired = 0) const override;
     bool initializeGPUDevice(size_t memoryRequired, const std::string &name) const override;
     bool initializeGPUDevice(int device, std::string *unavail_reason = nullptr) const override;
     bool hasGPUDevice() const override;
